@@ -1,0 +1,6 @@
+# Libraries klasöründeki tüm kütüphane klasörlerini ve dosyalarını yoksay
+*
+
+# Yalnızca bu .gitignore ve readme.txt dosyasını koru
+!.gitignore
+!readme.txt

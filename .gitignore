@@ -1,0 +1,44 @@
+# ==========================================
+# GİZLİ BİLGİLER VE APİ ANAHTARLARI (SECRETS)
+# ==========================================
+env.h
+**/env.h
+secrets.h
+**/secrets.h
+config.local.h
+**/config.local.h
+.env
+*.env
+*.env.*
+
+# ==========================================
+# KÜTÜPHANELER (LIBRARIES)
+# ==========================================
+libraries/*
+!libraries/readme.txt
+!libraries/.gitignore
+
+# ==========================================
+# DERLEME VE GEÇİCİ DOSYALAR (BUILD ARTIFACTS)
+# ==========================================
+build/
+**/build/
+.pio/
+.pioenvs/
+.piolibdeps/
+*.bin
+*.hex
+*.elf
+*.o
+*.d
+
+# ==========================================
+# IDE & SİSTEM DOSYALARI
+# ==========================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
