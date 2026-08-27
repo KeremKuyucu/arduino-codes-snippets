@@ -20,8 +20,6 @@
 // ============================================================================
 
 #include <WiFi.h>
-#include <HTTPClient.h>
-#include <WiFiClientSecure.h>
 #include <esp_task_wdt.h>
 #include <Preferences.h>
 #include <SinricPro.h>
@@ -190,42 +188,6 @@ void initWatchdog() {
 
 void feedWatchdog() {
   esp_task_wdt_reset();
-}
-
-// ============================================================
-// DISCORD WEBHOOK BİLDİRİM FONKSİYONU (Char Buffer / Zero Fragmentation)
-// ============================================================
-void sendDiscordAlert(const char *message, bool mention = true) {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("[Discord]: Wi-Fi baglantisi olmadigi icin bildirim gonderilemedi.");
-    return;
-  }
-
-  WiFiClientSecure client;
-  client.setInsecure(); // Discord HTTPS sertifika dogrulamasini atla (Hafif ve hizli)
-
-  HTTPClient http;
-  if (http.begin(client, DISCORD_WEBHOOK_URL)) {
-    http.addHeader("Content-Type", "application/json");
-
-    char jsonPayload[640];
-    if (mention && strlen(DISCORD_USER_ID) > 0) {
-      snprintf(jsonPayload, sizeof(jsonPayload), "{\"content\":\"<@%s> %s\"}", DISCORD_USER_ID, message);
-    } else {
-      snprintf(jsonPayload, sizeof(jsonPayload), "{\"content\":\"%s\"}", message);
-    }
-
-    int httpResponseCode = http.POST((uint8_t*)jsonPayload, strlen(jsonPayload));
-    if (httpResponseCode >= 200 && httpResponseCode < 300) {
-      Serial.printf("[Discord]: Bildirim gonderildi. (HTTP %d)\r\n", httpResponseCode);
-    } else {
-      Serial.printf("[Discord]: Bildirim gonderilemedi! HTTP: %d, Hata: %s\r\n", 
-                    httpResponseCode, http.errorToString(httpResponseCode).c_str());
-    }
-    http.end();
-  } else {
-    Serial.println("[Discord]: HTTP Client baslatilamadi.");
-  }
 }
 
 // Mavi LED Parlaklık Kontrol Yardımcısı
@@ -399,13 +361,9 @@ void handleTemperatureAutomation() {
         setRfState(false, true);
       }
 
-      // Discord Bildirimi: Tekrarlayan spam'i onlemek icin durum ilk olustugunda yolla
       if (!dhtErrorActive) {
         dhtErrorActive = true;
-        const char alertMsg[] = "🚨 **[HATA] Termostat DHT11 Sensör Arızası!**\\n"
-                                "Sensörden üst üste 3 okuma boyunca veri alınamadı (NaN / Kablo temassızlığı).\\n"
-                                "⚠️ **Güvenlik Tedbiri:** Kombi için otomatik **KAPATMA** sinyali gönderildi.";
-        sendDiscordAlert(alertMsg, true);
+        Serial.println("[HATA]: DHT11 Sensor Arizasi Aktif! (Kombiye kapatma sinyali gonderildi)");
       }
     }
     return;
@@ -419,11 +377,6 @@ void handleTemperatureAutomation() {
     dhtErrorActive = false;
     digitalWrite(LED_RED, LOW); // Sensor saglam, kirmizi led kapali
     Serial.println("[BILGI]: DHT11 sensoru tekrar normale dondu.");
-    char recoverMsg[192];
-    snprintf(recoverMsg, sizeof(recoverMsg),
-             "✅ **[BİLGİ] Termostat DHT11 Sensörü Normale Döndü.**\\n"
-             "Mevcut Sıcaklık: %.1f °C | Nem: %%%.1f", currentTemp, currentHumidity);
-    sendDiscordAlert(recoverMsg, false);
   } else {
     digitalWrite(LED_RED, LOW); // Sensor saglam, kirmizi led kapali
   }
@@ -493,14 +446,10 @@ void setup() {
 
   setupWiFi();
 
-  // Eger cihaz WDT veya Panic/Crash sonrasi yeniden basladiysa Discord'a bildir
+  // Eger cihaz WDT veya Panic/Crash sonrasi yeniden basladiysa Serial log bas
   if (resetReason == ESP_RST_TASK_WDT || resetReason == ESP_RST_WDT || 
       resetReason == ESP_RST_INT_WDT || resetReason == ESP_RST_PANIC) {
-    char wdtAlert[192];
-    snprintf(wdtAlert, sizeof(wdtAlert),
-             "⚠️ **[UYARI] Termostat Kilitlenme/Watchdog Sonrası Yeniden Başlatıldı!**\\n"
-             "Reset Nedeni Kodu: %d", (int)resetReason);
-    sendDiscordAlert(wdtAlert, true);
+    Serial.printf("[WDT]: UYARI - Cihaz kilitlenme/WDT sonrasi yeniden baslatildi! (Kod: %d)\r\n", (int)resetReason);
   }
 
   setupSinricPro();
