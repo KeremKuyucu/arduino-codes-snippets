@@ -20,6 +20,10 @@
 // ============================================================================
 
 #include <WiFi.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <esp_task_wdt.h>
+#include <Preferences.h>
 #include <SinricPro.h>
 #include <SinricProThermostat.h>
 #include <DHT.h>
@@ -54,14 +58,36 @@
 #define BLUE_DIM_DUTY     15    // 0-255 arası parlaklık değeri (15 = yaklaşık %6 yumuşak loş ışık)
 
 // ==========================================
-// OTOMASYON / TERMOSTAT AYARLARI
+// OTOMASYON / TERMOSTAT AYARLARI & NVS
 // ==========================================
-float targetTemperature = 22.0;
-float hysteresis = 0.5;
+float targetTemperature = 22.0f;
+float hysteresis = 0.5f;
 bool devicePowerState = true;
-String thermostatMode = "HEAT";
+char thermostatMode[16] = "HEAT";
 bool rfState = false;
 bool sinricConnected = false;
+bool dhtErrorActive = false;     // DHT11 sensör hata durumu takibi
+int dhtFailCount = 0;            // Ardışık hatalı okuma sayacı
+const int DHT_MAX_CONSECUTIVE_FAILS = 3; // 3 ardışık hata (~9 sn) olmadan hata tetiklenmez
+
+// Minimum RF Değişim Aralığı (Kombi Kısa Döngü / Short-cycling Koruması)
+unsigned long lastRfChangeTime = 0;
+const unsigned long MIN_RF_CHANGE_INTERVAL_MS = 60000; // Açma/kapama arasında minimum 60 sn
+
+// Wi-Fi Runtime İzleme
+unsigned long lastWiFiCheck = 0;
+const unsigned long WIFI_CHECK_INTERVAL = 5000; // 5 sn'de bir Wi-Fi kontrolü
+
+// NVS & Flash Aşınma Koruması (Debounce)
+Preferences preferences;
+bool settingsDirty = false;
+unsigned long lastSettingChangeTime = 0;
+const unsigned long NVS_SAVE_DEBOUNCE_MS = 5000; // Değişiklikten 5 sn sonra Flash'a yaz
+
+// ==========================================
+// WATCHDOG TIMER (WDT) AYARLARI
+// ==========================================
+#define WDT_TIMEOUT_SECONDS 15
 
 // ==========================================
 // DHT11 & ZAMANLAMA
@@ -99,6 +125,109 @@ const uint16_t pktClose[] PROGMEM = {
   416, 856, 392, 856, 804, 440
 };
 
+// ============================================================
+// NVS (PREFERENCES) AYAR YÖNETİMİ & DEBOUNCE
+// ============================================================
+void loadSettingsFromNVS() {
+  if (!preferences.begin("thermostat", true)) { // Salt okunur mod
+    Serial.println("[NVS]: Namespace acilamadi, varsayilan ayarlar kullaniliyor.");
+    return;
+  }
+  targetTemperature = preferences.getFloat("targetTemp", 22.0f);
+  hysteresis = preferences.getFloat("hysteresis", 0.5f);
+  devicePowerState = preferences.getBool("powerState", true);
+  String modeStr = preferences.getString("mode", "HEAT");
+  strncpy(thermostatMode, modeStr.c_str(), sizeof(thermostatMode) - 1);
+  thermostatMode[sizeof(thermostatMode) - 1] = '\0';
+  preferences.end();
+
+  Serial.printf("[NVS]: Ayarlar yuklendi -> Hedef: %.1f C | Histerezis: %.1f C | Guc: %s | Mod: %s\r\n",
+                targetTemperature, hysteresis, devicePowerState ? "ACIK" : "KAPALI", thermostatMode);
+}
+
+void saveSettingsToNVS() {
+  if (!preferences.begin("thermostat", false)) { // Okuma/Yazma modu
+    Serial.println("[NVS]: Yazma icin namespace acilamadi!");
+    return;
+  }
+  preferences.putFloat("targetTemp", targetTemperature);
+  preferences.putFloat("hysteresis", hysteresis);
+  preferences.putBool("powerState", devicePowerState);
+  preferences.putString("mode", thermostatMode);
+  preferences.end();
+  settingsDirty = false;
+  Serial.println("[NVS]: Ayarlar Flash bellege (NVS) basariyla kaydedildi.");
+}
+
+void markSettingsChanged() {
+  settingsDirty = true;
+  lastSettingChangeTime = millis();
+}
+
+void handleNvsDebounce() {
+  if (settingsDirty && (millis() - lastSettingChangeTime >= NVS_SAVE_DEBOUNCE_MS)) {
+    saveSettingsToNVS();
+  }
+}
+
+// ============================================================
+// WATCHDOG TIMER (WDT) YARDIMCILARI
+// ============================================================
+void initWatchdog() {
+#if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
+  esp_task_wdt_config_t wdt_config = {
+    .timeout_ms = WDT_TIMEOUT_SECONDS * 1000,
+    .idle_core_mask = 0,
+    .trigger_panic = true
+  };
+  esp_task_wdt_init(&wdt_config);
+#else
+  esp_task_wdt_init(WDT_TIMEOUT_SECONDS, true);
+#endif
+  esp_task_wdt_add(NULL);
+  Serial.println("[WDT]: Watchdog Timer (15s) baslatildi.");
+}
+
+void feedWatchdog() {
+  esp_task_wdt_reset();
+}
+
+// ============================================================
+// DISCORD WEBHOOK BİLDİRİM FONKSİYONU (Char Buffer / Zero Fragmentation)
+// ============================================================
+void sendDiscordAlert(const char *message, bool mention = true) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[Discord]: Wi-Fi baglantisi olmadigi icin bildirim gonderilemedi.");
+    return;
+  }
+
+  WiFiClientSecure client;
+  client.setInsecure(); // Discord HTTPS sertifika dogrulamasini atla (Hafif ve hizli)
+
+  HTTPClient http;
+  if (http.begin(client, DISCORD_WEBHOOK_URL)) {
+    http.addHeader("Content-Type", "application/json");
+
+    char jsonPayload[640];
+    if (mention && strlen(DISCORD_USER_ID) > 0) {
+      snprintf(jsonPayload, sizeof(jsonPayload), "{\"content\":\"<@%s> %s\"}", DISCORD_USER_ID, message);
+    } else {
+      snprintf(jsonPayload, sizeof(jsonPayload), "{\"content\":\"%s\"}", message);
+    }
+
+    int httpResponseCode = http.POST((uint8_t*)jsonPayload, strlen(jsonPayload));
+    if (httpResponseCode >= 200 && httpResponseCode < 300) {
+      Serial.printf("[Discord]: Bildirim gonderildi. (HTTP %d)\r\n", httpResponseCode);
+    } else {
+      Serial.printf("[Discord]: Bildirim gonderilemedi! HTTP: %d, Hata: %s\r\n", 
+                    httpResponseCode, http.errorToString(httpResponseCode).c_str());
+    }
+    http.end();
+  } else {
+    Serial.println("[Discord]: HTTP Client baslatilamadi.");
+  }
+}
+
 // Mavi LED Parlaklık Kontrol Yardımcısı
 void setBlueLedBrightness(uint8_t duty) {
 #if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
@@ -122,10 +251,19 @@ void sendRawSignal(const uint16_t* signal, size_t length, int repeats = 5) {
   }
 }
 
-void setRfState(bool state) {
+void setRfState(bool state, bool force = false) {
   if (rfState == state) return;
-  
+
+  unsigned long currentMillis = millis();
+  // Acil durumlar (force = true) haricinde minimum degisim suresi dolmadiysa kisa dongu engelle
+  if (!force && (currentMillis - lastRfChangeTime < MIN_RF_CHANGE_INTERVAL_MS) && lastRfChangeTime != 0) {
+    Serial.printf("[RF]: Degisim engellendi (Kombi kisa dongu korumasi: %lu sn beklemede)\r\n", 
+                  (MIN_RF_CHANGE_INTERVAL_MS - (currentMillis - lastRfChangeTime)) / 1000);
+    return;
+  }
+
   rfState = state;
+  lastRfChangeTime = currentMillis;
   digitalWrite(LED_GREEN, state ? HIGH : LOW); // Yeşil LED: Kombi Durumu
 
   if (state) {
@@ -139,9 +277,12 @@ void setRfState(bool state) {
 
 bool onPowerState(const String &deviceId, bool &state) {
   Serial.printf("[SinricPro]: Termostat Gucu -> %s\r\n", state ? "ACIK" : "KAPALI");
-  devicePowerState = state;
+  if (devicePowerState != state) {
+    devicePowerState = state;
+    markSettingsChanged();
+  }
   if (!devicePowerState) {
-    setRfState(false);
+    setRfState(false, true); // Kullanıcı kapattığında gecikmesiz kapat
   } else {
     lastTempCheck = 0;
   }
@@ -149,7 +290,10 @@ bool onPowerState(const String &deviceId, bool &state) {
 }
 
 bool onTargetTemperature(const String &deviceId, float &temp) {
-  targetTemperature = temp;
+  if (abs(targetTemperature - temp) > 0.01f) {
+    targetTemperature = temp;
+    markSettingsChanged();
+  }
   Serial.printf("[SinricPro]: Yeni Hedef Sicaklik -> %.1f C\r\n", targetTemperature);
   lastTempCheck = 0;
   return true;
@@ -157,6 +301,7 @@ bool onTargetTemperature(const String &deviceId, float &temp) {
 
 bool onAdjustTargetTemperature(const String &deviceId, float &tempDelta) {
   targetTemperature += tempDelta;
+  markSettingsChanged();
   Serial.printf("[SinricPro]: Hedef Sicaklik Degistirildi -> %.1f C\r\n", targetTemperature);
   lastTempCheck = 0;
   return true;
@@ -164,11 +309,15 @@ bool onAdjustTargetTemperature(const String &deviceId, float &tempDelta) {
 
 bool onThermostatMode(const String &deviceId, String &mode) {
   mode.toUpperCase();
-  thermostatMode = mode;
-  Serial.printf("[SinricPro]: Mod Degisti -> %s\r\n", mode.c_str());
+  if (strcmp(thermostatMode, mode.c_str()) != 0) {
+    strncpy(thermostatMode, mode.c_str(), sizeof(thermostatMode) - 1);
+    thermostatMode[sizeof(thermostatMode) - 1] = '\0';
+    markSettingsChanged();
+  }
+  Serial.printf("[SinricPro]: Mod Degisti -> %s\r\n", thermostatMode);
   
-  if (mode == "OFF") {
-    setRfState(false);
+  if (strcmp(thermostatMode, "OFF") == 0) {
+    setRfState(false, true); // OFF moduna alindiginda gecikmesiz kapat
   }
   lastTempCheck = 0;
   return true;
@@ -180,6 +329,7 @@ void setupWiFi() {
   
   bool blinkState = false;
   while (WiFi.status() != WL_CONNECTED) {
+    feedWatchdog(); // Wi-Fi baglantisi sirasinda WDT'yi besle
     blinkState = !blinkState;
     setBlueLedBrightness(blinkState ? 100 : 0); // Baglanirken belirgin sekilde yanip soner
     delay(300);
@@ -188,6 +338,18 @@ void setupWiFi() {
   
   setBlueLedBrightness(BLUE_DIM_DUTY); // Baglanti basarili -> Parlaklik hemen kısılarak loşa düşer
   Serial.printf("\n[WiFi]: Baglanti basarili! IP: %s\r\n", WiFi.localIP().toString().c_str());
+}
+
+void handleWiFiRuntime() {
+  unsigned long currentMillis = millis();
+  if (currentMillis - lastWiFiCheck < WIFI_CHECK_INTERVAL) return;
+  lastWiFiCheck = currentMillis;
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[WiFi]: Baglanti koptu! Yeniden baglaniliyor...");
+    setBlueLedBrightness(0); // Baglanti yokken LED sonuk
+    WiFi.reconnect();
+  }
 }
 
 void setupSinricPro() {
@@ -221,43 +383,92 @@ void handleTemperatureAutomation() {
   float currentTemp = dht.readTemperature();
   float currentHumidity = dht.readHumidity();
 
-  // Sensor Hatasi Kontrolu
+  // Sensor Hatasi Kontrolu & Debounce (Ardışık Hata Filtresi)
   if (isnan(currentTemp) || isnan(currentHumidity)) {
-    Serial.println("[HATA]: DHT11 verisi okunamadi!");
-    digitalWrite(LED_RED, HIGH); // Kirmizi LED: Sensor Hatasi
+    dhtFailCount++;
+    Serial.printf("[HATA]: DHT11 verisi okunamadi! (Ardisik Hata: %d/%d)\r\n", 
+                  dhtFailCount, DHT_MAX_CONSECUTIVE_FAILS);
+
+    // Yalnızca ardışık hata eşiği aşıldığında sistemi hata durumuna geçir
+    if (dhtFailCount >= DHT_MAX_CONSECUTIVE_FAILS) {
+      digitalWrite(LED_RED, HIGH); // Kirmizi LED: Sensor Hatasi
+
+      // GUVENLIK: Sensor kalici olarak bozuldugunda kombiyi derhal kapat (force = true)
+      if (rfState) {
+        Serial.println("[GUVENLIK]: Kalici sensor arizasi nedeniyle kombi KAPATILIYOR!");
+        setRfState(false, true);
+      }
+
+      // Discord Bildirimi: Tekrarlayan spam'i onlemek icin durum ilk olustugunda yolla
+      if (!dhtErrorActive) {
+        dhtErrorActive = true;
+        const char alertMsg[] = "🚨 **[HATA] Termostat DHT11 Sensör Arızası!**\\n"
+                                "Sensörden üst üste 3 okuma boyunca veri alınamadı (NaN / Kablo temassızlığı).\\n"
+                                "⚠️ **Güvenlik Tedbiri:** Kombi için otomatik **KAPATMA** sinyali gönderildi.";
+        sendDiscordAlert(alertMsg, true);
+      }
+    }
     return;
   }
-  digitalWrite(LED_RED, LOW); // Sensor saglam, kirmizi led kapali
 
-  String currentMode = thermostatMode;
-  currentMode.toUpperCase();
+  // Okuma basarili -> Hata sayacini sifirla
+  dhtFailCount = 0;
 
-  Serial.printf("[DHT11]: Sicaklik: %.1f C | Nem: %.1f %% | Hedef: %.1f C | Mod: %s\r\n", 
-                currentTemp, currentHumidity, targetTemperature, currentMode.c_str());
+  // Sensor normale dondugunde
+  if (dhtErrorActive) {
+    dhtErrorActive = false;
+    digitalWrite(LED_RED, LOW); // Sensor saglam, kirmizi led kapali
+    Serial.println("[BILGI]: DHT11 sensoru tekrar normale dondu.");
+    char recoverMsg[192];
+    snprintf(recoverMsg, sizeof(recoverMsg),
+             "✅ **[BİLGİ] Termostat DHT11 Sensörü Normale Döndü.**\\n"
+             "Mevcut Sıcaklık: %.1f °C | Nem: %%%.1f", currentTemp, currentHumidity);
+    sendDiscordAlert(recoverMsg, false);
+  } else {
+    digitalWrite(LED_RED, LOW); // Sensor saglam, kirmizi led kapali
+  }
+
+  Serial.printf("[DHT11]: Sicaklik: %.1f C | Nem: %.1f %% | Hedef: %.1f C (±%.1f) | Mod: %s\r\n", 
+                currentTemp, currentHumidity, targetTemperature, hysteresis, thermostatMode);
 
   SinricProThermostat &myThermostat = SinricPro[THERMOSTAT_ID];
   myThermostat.sendTemperatureEvent(currentTemp, currentHumidity);
 
-  if (!devicePowerState || currentMode == "OFF") {
-    if (rfState) setRfState(false);
+  if (!devicePowerState || strcmp(thermostatMode, "OFF") == 0) {
+    if (rfState) setRfState(false, true);
     return;
   }
 
-  if (currentMode == "HEAT" || currentMode == "AUTO") {
-    if (currentTemp < targetTemperature && !rfState) {
-      Serial.printf("[Otomasyon]: Sicaklik (%.1f C) hedefin altinda -> CALISTIRILIYOR\r\n", currentTemp);
+  if (strcmp(thermostatMode, "HEAT") == 0 || strcmp(thermostatMode, "AUTO") == 0) {
+    float lowerThreshold = targetTemperature - hysteresis;
+    float upperThreshold = targetTemperature + hysteresis;
+
+    // Çift Yönlü Histerezis (Kısa döngü / Short-cycling koruması):
+    if (currentTemp <= lowerThreshold && !rfState) {
+      Serial.printf("[Otomasyon]: Sicaklik (%.1f C) alt esik altinda (<= %.1f C) -> CALISTIRILIYOR\r\n", 
+                    currentTemp, lowerThreshold);
       setRfState(true);
-    } else if (currentTemp >= (targetTemperature + hysteresis) && rfState) {
-      Serial.printf("[Otomasyon]: Sicaklik (%.1f C) hedefe ulasti -> DURDURULUYOR\r\n", currentTemp);
+    } else if (currentTemp >= upperThreshold && rfState) {
+      Serial.printf("[Otomasyon]: Sicaklik (%.1f C) ust esige ulasti (>= %.1f C) -> DURDURULUYOR\r\n", 
+                    currentTemp, upperThreshold);
       setRfState(false);
     }
-  } else if (currentMode == "COOL") {
+  } else if (strcmp(thermostatMode, "COOL") == 0) {
     if (!rfState) setRfState(true);
   }
 }
 
 void setup() {
   Serial.begin(115200);
+
+  // Son reset nedenini tespit et
+  esp_reset_reason_t resetReason = esp_reset_reason();
+
+  // Watchdog Timer Başlat
+  initWatchdog();
+
+  // NVS'den kaydedilmiş ayarları yükle (Elektrik kesintisi koruması)
+  loadSettingsFromNVS();
 
   // Mavi LED PWM Kurulumu
 #if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
@@ -281,10 +492,27 @@ void setup() {
   dht.begin();
 
   setupWiFi();
+
+  // Eger cihaz WDT veya Panic/Crash sonrasi yeniden basladiysa Discord'a bildir
+  if (resetReason == ESP_RST_TASK_WDT || resetReason == ESP_RST_WDT || 
+      resetReason == ESP_RST_INT_WDT || resetReason == ESP_RST_PANIC) {
+    char wdtAlert[192];
+    snprintf(wdtAlert, sizeof(wdtAlert),
+             "⚠️ **[UYARI] Termostat Kilitlenme/Watchdog Sonrası Yeniden Başlatıldı!**\\n"
+             "Reset Nedeni Kodu: %d", (int)resetReason);
+    sendDiscordAlert(wdtAlert, true);
+  }
+
   setupSinricPro();
 }
 
 void loop() {
+  feedWatchdog();
+  handleWiFiRuntime();
   SinricPro.handle();
   handleTemperatureAutomation();
+  handleNvsDebounce();
 }
+
+
+
