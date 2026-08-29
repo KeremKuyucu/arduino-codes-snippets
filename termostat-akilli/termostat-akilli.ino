@@ -127,7 +127,7 @@ const uint16_t pktClose[] PROGMEM = {
 // NVS (PREFERENCES) AYAR YÖNETİMİ & DEBOUNCE
 // ============================================================
 void loadSettingsFromNVS() {
-  if (!preferences.begin("thermostat", true)) { // Salt okunur mod
+  if (!preferences.begin("thermostat", true)) {
     Serial.println("[NVS]: Namespace acilamadi, varsayilan ayarlar kullaniliyor.");
     return;
   }
@@ -144,7 +144,7 @@ void loadSettingsFromNVS() {
 }
 
 void saveSettingsToNVS() {
-  if (!preferences.begin("thermostat", false)) { // Okuma/Yazma modu
+  if (!preferences.begin("thermostat", false)) {
     Serial.println("[NVS]: Yazma icin namespace acilamadi!");
     return;
   }
@@ -178,12 +178,12 @@ void initWatchdog() {
     .idle_core_mask = 0,
     .trigger_panic = true
   };
-  esp_task_wdt_init(&wdt_config);
+  esp_task_wdt_reconfigure(&wdt_config);
 #else
   esp_task_wdt_init(WDT_TIMEOUT_SECONDS, true);
 #endif
   esp_task_wdt_add(NULL);
-  Serial.println("[WDT]: Watchdog Timer (15s) baslatildi.");
+  Serial.println("[WDT]: Watchdog Timer baslatildi.");
 }
 
 void feedWatchdog() {
@@ -209,6 +209,7 @@ void sendRawSignal(const uint16_t* signal, size_t length, int repeats = 5) {
       state = !state;
     }
     digitalWrite(RF_PIN, LOW);
+    feedWatchdog();
     delay(10);
   }
 }
@@ -217,7 +218,6 @@ void setRfState(bool state, bool force = false) {
   if (rfState == state) return;
 
   unsigned long currentMillis = millis();
-  // Acil durumlar (force = true) haricinde minimum degisim suresi dolmadiysa kisa dongu engelle
   if (!force && (currentMillis - lastRfChangeTime < MIN_RF_CHANGE_INTERVAL_MS) && lastRfChangeTime != 0) {
     Serial.printf("[RF]: Degisim engellendi (Kombi kisa dongu korumasi: %lu sn beklemede)\r\n", 
                   (MIN_RF_CHANGE_INTERVAL_MS - (currentMillis - lastRfChangeTime)) / 1000);
@@ -226,7 +226,7 @@ void setRfState(bool state, bool force = false) {
 
   rfState = state;
   lastRfChangeTime = currentMillis;
-  digitalWrite(LED_GREEN, state ? HIGH : LOW); // Yeşil LED: Kombi Durumu
+  digitalWrite(LED_GREEN, state ? HIGH : LOW);
 
   if (state) {
     sendRawSignal(pktOpen, sizeof(pktOpen) / sizeof(pktOpen[0]));
@@ -244,7 +244,7 @@ bool onPowerState(const String &deviceId, bool &state) {
     markSettingsChanged();
   }
   if (!devicePowerState) {
-    setRfState(false, true); // Kullanıcı kapattığında gecikmesiz kapat
+    setRfState(false, true);
   } else {
     lastTempCheck = 0;
   }
@@ -279,7 +279,7 @@ bool onThermostatMode(const String &deviceId, String &mode) {
   Serial.printf("[SinricPro]: Mod Degisti -> %s\r\n", thermostatMode);
   
   if (strcmp(thermostatMode, "OFF") == 0) {
-    setRfState(false, true); // OFF moduna alindiginda gecikmesiz kapat
+    setRfState(false, true);
   }
   lastTempCheck = 0;
   return true;
@@ -291,14 +291,15 @@ void setupWiFi() {
   
   bool blinkState = false;
   while (WiFi.status() != WL_CONNECTED) {
-    feedWatchdog(); // Wi-Fi baglantisi sirasinda WDT'yi besle
+    feedWatchdog();
     blinkState = !blinkState;
-    setBlueLedBrightness(blinkState ? 100 : 0); // Baglanirken belirgin sekilde yanip soner
+    setBlueLedBrightness(blinkState ? 100 : 0);
     delay(300);
     Serial.print(".");
   }
   
-  setBlueLedBrightness(BLUE_DIM_DUTY); // Baglanti basarili -> Parlaklik hemen kısılarak loşa düşer
+  feedWatchdog();
+  setBlueLedBrightness(BLUE_DIM_DUTY);
   Serial.printf("\n[WiFi]: Baglanti basarili! IP: %s\r\n", WiFi.localIP().toString().c_str());
 }
 
@@ -309,7 +310,7 @@ void handleWiFiRuntime() {
 
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("[WiFi]: Baglanti koptu! Yeniden baglaniliyor...");
-    setBlueLedBrightness(0); // Baglanti yokken LED sonuk
+    setBlueLedBrightness(0);
     WiFi.reconnect();
   }
 }
@@ -325,16 +326,17 @@ void setupSinricPro() {
   SinricPro.onConnected([](){ 
     Serial.println("[SinricPro]: Baglanti kuruldu."); 
     sinricConnected = true;
-    setBlueLedBrightness(BLUE_DIM_DUTY); // Buluta bagliyken los yanar
+    setBlueLedBrightness(BLUE_DIM_DUTY);
   });
   
   SinricPro.onDisconnected([](){ 
     Serial.println("[SinricPro]: Baglanti kesildi."); 
     sinricConnected = false;
-    setBlueLedBrightness(0); // Baglanti koptugunda tamamen soner
+    setBlueLedBrightness(0);
   });
   
   SinricPro.begin(APP_KEY, APP_SECRET);
+  feedWatchdog();
 }
 
 void handleTemperatureAutomation() {
@@ -345,17 +347,14 @@ void handleTemperatureAutomation() {
   float currentTemp = dht.readTemperature();
   float currentHumidity = dht.readHumidity();
 
-  // Sensor Hatasi Kontrolu & Debounce (Ardışık Hata Filtresi)
   if (isnan(currentTemp) || isnan(currentHumidity)) {
     dhtFailCount++;
     Serial.printf("[HATA]: DHT11 verisi okunamadi! (Ardisik Hata: %d/%d)\r\n", 
                   dhtFailCount, DHT_MAX_CONSECUTIVE_FAILS);
 
-    // Yalnızca ardışık hata eşiği aşıldığında sistemi hata durumuna geçir
     if (dhtFailCount >= DHT_MAX_CONSECUTIVE_FAILS) {
-      digitalWrite(LED_RED, HIGH); // Kirmizi LED: Sensor Hatasi
+      digitalWrite(LED_RED, HIGH);
 
-      // GUVENLIK: Sensor kalici olarak bozuldugunda kombiyi derhal kapat (force = true)
       if (rfState) {
         Serial.println("[GUVENLIK]: Kalici sensor arizasi nedeniyle kombi KAPATILIYOR!");
         setRfState(false, true);
@@ -369,23 +368,23 @@ void handleTemperatureAutomation() {
     return;
   }
 
-  // Okuma basarili -> Hata sayacini sifirla
   dhtFailCount = 0;
 
-  // Sensor normale dondugunde
   if (dhtErrorActive) {
     dhtErrorActive = false;
-    digitalWrite(LED_RED, LOW); // Sensor saglam, kirmizi led kapali
+    digitalWrite(LED_RED, LOW);
     Serial.println("[BILGI]: DHT11 sensoru tekrar normale dondu.");
   } else {
-    digitalWrite(LED_RED, LOW); // Sensor saglam, kirmizi led kapali
+    digitalWrite(LED_RED, LOW);
   }
 
   Serial.printf("[DHT11]: Sicaklik: %.1f C | Nem: %.1f %% | Hedef: %.1f C (±%.1f) | Mod: %s\r\n", 
                 currentTemp, currentHumidity, targetTemperature, hysteresis, thermostatMode);
 
-  SinricProThermostat &myThermostat = SinricPro[THERMOSTAT_ID];
-  myThermostat.sendTemperatureEvent(currentTemp, currentHumidity);
+  if (sinricConnected) {
+    SinricProThermostat &myThermostat = SinricPro[THERMOSTAT_ID];
+    myThermostat.sendTemperatureEvent(currentTemp, currentHumidity);
+  }
 
   if (!devicePowerState || strcmp(thermostatMode, "OFF") == 0) {
     if (rfState) setRfState(false, true);
@@ -396,7 +395,6 @@ void handleTemperatureAutomation() {
     float lowerThreshold = targetTemperature - hysteresis;
     float upperThreshold = targetTemperature + hysteresis;
 
-    // Çift Yönlü Histerezis (Kısa döngü / Short-cycling koruması):
     if (currentTemp <= lowerThreshold && !rfState) {
       Serial.printf("[Otomasyon]: Sicaklik (%.1f C) alt esik altinda (<= %.1f C) -> CALISTIRILIYOR\r\n", 
                     currentTemp, lowerThreshold);
@@ -414,16 +412,13 @@ void handleTemperatureAutomation() {
 void setup() {
   Serial.begin(115200);
 
-  // Son reset nedenini tespit et
   esp_reset_reason_t resetReason = esp_reset_reason();
 
-  // Watchdog Timer Başlat
   initWatchdog();
+  feedWatchdog();
 
-  // NVS'den kaydedilmiş ayarları yükle (Elektrik kesintisi koruması)
   loadSettingsFromNVS();
 
-  // Mavi LED PWM Kurulumu
 #if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
   ledcAttach(LED_BLUE, BLUE_PWM_FREQ, BLUE_PWM_RES);
 #else
@@ -432,7 +427,6 @@ void setup() {
 #endif
   setBlueLedBrightness(0);
 
-  // Diger LED'ler
   pinMode(LED_GREEN, OUTPUT);
   pinMode(LED_RED, OUTPUT);
 
@@ -446,13 +440,13 @@ void setup() {
 
   setupWiFi();
 
-  // Eger cihaz WDT veya Panic/Crash sonrasi yeniden basladiysa Serial log bas
   if (resetReason == ESP_RST_TASK_WDT || resetReason == ESP_RST_WDT || 
       resetReason == ESP_RST_INT_WDT || resetReason == ESP_RST_PANIC) {
     Serial.printf("[WDT]: UYARI - Cihaz kilitlenme/WDT sonrasi yeniden baslatildi! (Kod: %d)\r\n", (int)resetReason);
   }
 
   setupSinricPro();
+  feedWatchdog();
 }
 
 void loop() {
@@ -461,7 +455,5 @@ void loop() {
   SinricPro.handle();
   handleTemperatureAutomation();
   handleNvsDebounce();
+  yield();
 }
-
-
-
