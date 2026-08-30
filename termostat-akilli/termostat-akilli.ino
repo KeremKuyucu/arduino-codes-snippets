@@ -510,5 +510,3 @@ void loop() {
   handleNvsDebounce();
   yield();
 }
-
-```
