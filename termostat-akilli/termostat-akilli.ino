@@ -53,7 +53,7 @@
 #define BLUE_PWM_CHANNEL  0
 #define BLUE_PWM_FREQ     5000
 #define BLUE_PWM_RES      8
-#define BLUE_DIM_DUTY     15    // 0-255 arası parlaklık değeri (15 = yaklaşık %6 yumuşak loş ışık)
+#define BLUE_DIM_DUTY     15    // 0-255 arası parlaklık değeri (~%6 loş ışık)
 
 // ==========================================
 // OTOMASYON / TERMOSTAT AYARLARI & NVS
@@ -64,28 +64,31 @@ bool devicePowerState = true;
 char thermostatMode[16] = "HEAT";
 bool rfState = false;
 bool sinricConnected = false;
-bool dhtErrorActive = false;     // DHT11 sensör hata durumu takibi
-int dhtFailCount = 0;            // Ardışık hatalı okuma sayacı
-const int DHT_MAX_CONSECUTIVE_FAILS = 3; // 3 ardışık hata (~9 sn) olmadan hata tetiklenmez
+bool dhtErrorActive = false;
+int dhtFailCount = 0;
+const int DHT_MAX_CONSECUTIVE_FAILS = 3;
 
-// Minimum RF Değişim Aralığı (Kombi Kısa Döngü / Short-cycling Koruması)
+// Minimum RF Değişim Aralığı (Short-cycling Koruması)
 unsigned long lastRfChangeTime = 0;
-const unsigned long MIN_RF_CHANGE_INTERVAL_MS = 60000; // Açma/kapama arasında minimum 60 sn
+const unsigned long MIN_RF_CHANGE_INTERVAL_MS = 60000;
 
 // Wi-Fi Runtime İzleme
 unsigned long lastWiFiCheck = 0;
-const unsigned long WIFI_CHECK_INTERVAL = 5000; // 5 sn'de bir Wi-Fi kontrolü
+const unsigned long WIFI_CHECK_INTERVAL = 10000;
+bool wasWiFiConnected = false;
+unsigned long lastWiFiReconnectAttempt = 0;
+const unsigned long WIFI_RECONNECT_COOLDOWN_MS = 60000;  // Yeniden bağlantı denemeleri arası min 60sn
 
 // NVS & Flash Aşınma Koruması (Debounce)
 Preferences preferences;
 bool settingsDirty = false;
 unsigned long lastSettingChangeTime = 0;
-const unsigned long NVS_SAVE_DEBOUNCE_MS = 5000; // Değişiklikten 5 sn sonra Flash'a yaz
+const unsigned long NVS_SAVE_DEBOUNCE_MS = 5000;
 
 // ==========================================
 // WATCHDOG TIMER (WDT) AYARLARI
 // ==========================================
-#define WDT_TIMEOUT_SECONDS 15
+#define WDT_TIMEOUT_SECONDS 20
 
 // ==========================================
 // DHT11 & ZAMANLAMA
@@ -93,7 +96,13 @@ const unsigned long NVS_SAVE_DEBOUNCE_MS = 5000; // Değişiklikten 5 sn sonra F
 DHT dht(DHTPIN, DHTTYPE);
 
 unsigned long lastTempCheck = 0;
-const unsigned long tempCheckInterval = 3000;
+const unsigned long tempCheckInterval = 3000;      // Lokal kontrol aralığı: 3 sn
+
+unsigned long lastCloudReport = 0;
+const unsigned long cloudReportInterval = 60000;   // Sinric Cloud raporlama: 60 sn (Rate limit koruması)
+
+float lastValidTemp = 0.0f;
+float lastValidHumidity = 0.0f;
 
 // ============================================================
 // DOĞRULANMIŞ AÇMA PAKETİ (Paket 127)
@@ -287,10 +296,16 @@ bool onThermostatMode(const String &deviceId, String &mode) {
 
 void setupWiFi() {
   Serial.printf("\r\n[WiFi]: %s agina baglaniliyor", WIFI_SSID);
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.persistent(true);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   
+  unsigned long startAttemptTime = millis();
   bool blinkState = false;
-  while (WiFi.status() != WL_CONNECTED) {
+
+  // 15 saniyelik zaman aşımı ile sonsuz döngü ve WDT çökmesi engellenir
+  while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < 15000) {
     feedWatchdog();
     blinkState = !blinkState;
     setBlueLedBrightness(blinkState ? 100 : 0);
@@ -298,9 +313,15 @@ void setupWiFi() {
     Serial.print(".");
   }
   
+  if (WiFi.status() == WL_CONNECTED) {
+    wasWiFiConnected = true;
+    setBlueLedBrightness(BLUE_DIM_DUTY);
+    Serial.printf("\n[WiFi]: Baglanti basarili! IP: %s\r\n", WiFi.localIP().toString().c_str());
+  } else {
+    setBlueLedBrightness(0);
+    Serial.println("\n[WiFi]: Ilk baglanti basarisiz, loop icinde tekrar denenecek.");
+  }
   feedWatchdog();
-  setBlueLedBrightness(BLUE_DIM_DUTY);
-  Serial.printf("\n[WiFi]: Baglanti basarili! IP: %s\r\n", WiFi.localIP().toString().c_str());
 }
 
 void handleWiFiRuntime() {
@@ -308,10 +329,37 @@ void handleWiFiRuntime() {
   if (currentMillis - lastWiFiCheck < WIFI_CHECK_INTERVAL) return;
   lastWiFiCheck = currentMillis;
 
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("[WiFi]: Baglanti koptu! Yeniden baglaniliyor...");
-    setBlueLedBrightness(0);
-    WiFi.reconnect();
+  bool isConnected = (WiFi.status() == WL_CONNECTED);
+
+  // Wi-Fi yeniden bağlandığında LED durumunu güncelle
+  if (isConnected && !wasWiFiConnected) {
+    wasWiFiConnected = true;
+    Serial.printf("[WiFi]: Baglanti yeniden kuruldu! IP: %s\r\n", WiFi.localIP().toString().c_str());
+    // SinricPro henüz bağlanmadıysa bile WiFi var → loş yak
+    if (!sinricConnected) {
+      setBlueLedBrightness(BLUE_DIM_DUTY);
+    }
+  }
+
+  // Wi-Fi koptuğunda
+  if (!isConnected) {
+    if (wasWiFiConnected) {
+      wasWiFiConnected = false;
+      sinricConnected = false;
+      setBlueLedBrightness(0);
+      Serial.println("[WiFi]: Baglanti koptu!");
+    }
+
+    // Otomatik yeniden bağlantı başarısız olursa, uzun aralıklarla manuel deneme
+    // (Kısa aralıklı disconnect+reconnect döngüsü bağlantıyı engelliyor!)
+    if (currentMillis - lastWiFiReconnectAttempt >= WIFI_RECONNECT_COOLDOWN_MS) {
+      lastWiFiReconnectAttempt = currentMillis;
+      Serial.println("[WiFi]: Otomatik baglanti basarisiz, manuel yeniden deneniyor...");
+      WiFi.disconnect(false);
+      delay(100);
+      feedWatchdog();
+      WiFi.begin(WIFI_SSID, WIFI_PASS);
+    }
   }
 }
 
@@ -362,13 +410,15 @@ void handleTemperatureAutomation() {
 
       if (!dhtErrorActive) {
         dhtErrorActive = true;
-        Serial.println("[HATA]: DHT11 Sensor Arizasi Aktif! (Kombiye kapatma sinyali gonderildi)");
+        Serial.println("[HATA]: DHT11 Sensor Arizasi Aktif!");
       }
     }
     return;
   }
 
   dhtFailCount = 0;
+  lastValidTemp = currentTemp;
+  lastValidHumidity = currentHumidity;
 
   if (dhtErrorActive) {
     dhtErrorActive = false;
@@ -381,7 +431,9 @@ void handleTemperatureAutomation() {
   Serial.printf("[DHT11]: Sicaklik: %.1f C | Nem: %.1f %% | Hedef: %.1f C (±%.1f) | Mod: %s\r\n", 
                 currentTemp, currentHumidity, targetTemperature, hysteresis, thermostatMode);
 
-  if (sinricConnected) {
+  // Bulut Raporlama (Rate-limit koruması: 60 saniyede bir gönderilir)
+  if (sinricConnected && (currentMillis - lastCloudReport >= cloudReportInterval)) {
+    lastCloudReport = currentMillis;
     SinricProThermostat &myThermostat = SinricPro[THERMOSTAT_ID];
     myThermostat.sendTemperatureEvent(currentTemp, currentHumidity);
   }
@@ -393,14 +445,14 @@ void handleTemperatureAutomation() {
 
   if (strcmp(thermostatMode, "HEAT") == 0 || strcmp(thermostatMode, "AUTO") == 0) {
     float lowerThreshold = targetTemperature - hysteresis;
-    float upperThreshold = targetTemperature + hysteresis;
+    float upperThreshold = targetTemperature;
 
     if (currentTemp <= lowerThreshold && !rfState) {
       Serial.printf("[Otomasyon]: Sicaklik (%.1f C) alt esik altinda (<= %.1f C) -> CALISTIRILIYOR\r\n", 
                     currentTemp, lowerThreshold);
       setRfState(true);
     } else if (currentTemp >= upperThreshold && rfState) {
-      Serial.printf("[Otomasyon]: Sicaklik (%.1f C) ust esige ulasti (>= %.1f C) -> DURDURULUYOR\r\n", 
+      Serial.printf("[Otomasyon]: Sicaklik (%.1f C) hedefe ulasti (>= %.1f C) -> DURDURULUYOR\r\n", 
                     currentTemp, upperThreshold);
       setRfState(false);
     }
@@ -441,8 +493,9 @@ void setup() {
   setupWiFi();
 
   if (resetReason == ESP_RST_TASK_WDT || resetReason == ESP_RST_WDT || 
-      resetReason == ESP_RST_INT_WDT || resetReason == ESP_RST_PANIC) {
-    Serial.printf("[WDT]: UYARI - Cihaz kilitlenme/WDT sonrasi yeniden baslatildi! (Kod: %d)\r\n", (int)resetReason);
+      resetReason == ESP_RST_INT_WDT || resetReason == ESP_RST_PANIC ||
+      resetReason == ESP_RST_BROWNOUT) {
+    Serial.printf("[WDT/SISTEM]: UYARI - Cihaz reset sonrasi baslatildi! (Neden Kodu: %d)\r\n", (int)resetReason);
   }
 
   setupSinricPro();
@@ -457,3 +510,5 @@ void loop() {
   handleNvsDebounce();
   yield();
 }
+
+```
